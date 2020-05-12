@@ -94,7 +94,9 @@
      become: true
      blockinfile: |
       dest=/etc/sysctl.conf
-      content="net.core.rmem_max = 16777216
+      content="fs.protected_hardlinks = 0
+        fs.protected_symlinks = 0
+        net.core.rmem_max = 16777216
         net.core.wmem_max = 16777216
         net.core.rmem_default = 16777216
         net.core.wmem_default = 16777216
@@ -147,7 +149,9 @@
       - { regexp: '^(\s*read_request_timeout_in_ms:\s+).*', line: '\g<1>1200000' }
       - { regexp: '^(\s*range_request_timeout_in_ms:\s+).*', line: '\g<1>1200000' }
       - { regexp: '^(\s*write_request_timeout_in_ms:\s+).*', line: '\g<1>1200000' }
-      - { regexp: '^(\s*request_timeout_in_ms:\s+).*', line: '\g<1>1200000' }      
+      - { regexp: '^(\s*request_timeout_in_ms:\s+).*', line: '\g<1>1200000' }
+      - { regexp: '^(\s*batch_size_warn_threshold_in_kb:\s+).*', line: '\g<1>500' }
+      - { regexp: '^(\s*batch_size_fail_threshold_in_kb:\s+).*', line: '\g<1>5000' }
    - name: Configure Cassandra Environment settings in cassandra-env.sh
      when: cassstop|success
      become: true

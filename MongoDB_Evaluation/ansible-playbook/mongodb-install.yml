@@ -5,10 +5,22 @@
   # 1) Mongo data nodes are named as mongod-1, mongod-2 etc and appear in the order in the Ansible host file provided
   # 2) Mongo config nodes are named as mongoconfig-1, mongoconfig-2 etc and appear in the order in the Ansible host file provided
   # 3) Mongo query router nodes are named as mongos-1, mongos-2 etc and appear in the order in the Ansible host file provided
+  # 4) Only one replica set of size 3 is configured for Configuration Servers 
+  # 5) Three replica sets of size 3 each (9 data nodes in total) is configured for data nodes
+  # 6) No security configuration required since this deployment is for testing on the Embassy Cloud
 ---
   - hosts: mongo_data_nodes, mongo_config_nodes, mongos_nodes
     vars:
-     host_ip: '{{ ansible_default_ipv4["address"] }}' 
+     host_ip: '{{ ansible_default_ipv4["address"] }}'
+     keyFilePath: "{{ keyFile }}"
+     newline: "\n"
+     mongoQueryRouterPort: "27017"     
+     configReplSetPort: "27019"
+     configReplSetName: "configReplSet"
+     configReplSetString: "{{ (':' + configReplSetPort + ',').join(groups['mongo_config_nodes']) + (':' + configReplSetPort) }}"
+     mongoReplSetPort: "27018"     
+
+    
     tasks:
     - name: Install EPEL for CentOS on all MongoDB nodes
       become: true
@@ -17,6 +29,7 @@
         state: installed 
         update_cache: yes
       register: epel_installed
+    
     - name: Install Pip on all MongoDB nodes
       when: epel_installed|success
       become: true
@@ -25,6 +38,7 @@
         state: installed 
         update_cache: yes
       register: pip_installed
+    
     - name: Install PyMongo and Ansible on all MongoDB nodes
       when: pip_installed|success
       become: true      
@@ -34,80 +48,16 @@
         - pymongo
         - ansible
       register: pymongo_ansible_installed
-    - name: Add MongoDB repository
-      when: pymongo_ansible_installed|success
-      yum_repository:
-        name: MongoDB-Repository
-        description: MongoDB Repository
-        baseurl: https://repo.mongodb.org/yum/redhat/$releasever/mongodb-org/3.6/x86_64/
-        gpgcheck: yes
-        enabled: yes
-        gpgkey: https://www.mongodb.org/static/pgp/server-3.6.asc
-        state: present
-      register: mongorepoadd
-    - name: Install MongoDB
-      when: mongorepoadd|success
-      yum:
-        pkg: mongodb-org-3.6.2
-        state: installed
-        update_cache: yes
-      register: mongoinstall
-    - name: Add Mongo data nodes and their corresponding IP addresses to /etc/hosts
-      when: mongoinstall|success
-      become: true
-      lineinfile:
-        dest: /etc/hosts        
-        line: "{{ item.0 + ' mongod-' + (item.1|string) }}"
-      with_together:
-      - "{{ groups['mongo_data_nodes'] }}"
-      - "{{ range(1,groups['mongo_data_nodes'].__len__()+1)|list }}"
-      register: add_mongod_nodes_to_hosts_file
-    - name: Add Mongo config nodes and their corresponding IP addresses to /etc/hosts
-      when: add_mongod_nodes_to_hosts_file|success
-      become: true
-      lineinfile:
-        dest: /etc/hosts        
-        line: "{{ item.0 + ' mongoconfig-' + (item.1|string) }}"
-      with_together:
-      - "{{ groups['mongo_config_nodes'] }}"
-      - "{{ range(1,groups['mongo_config_nodes'].__len__()+1)|list }}"
-      register: add_mongo_config_nodes_to_hosts_file
-    - name: Add Mongo query router nodes and their corresponding IP addresses to /etc/hosts
-      when: add_mongo_config_nodes_to_hosts_file|success
-      become: true
-      lineinfile:
-        dest: /etc/hosts        
-        line: "{{ item.0 + ' mongos-' + (item.1|string) }}"
-      with_together:
-      - "{{ groups['mongos_nodes'] }}"
-      - "{{ range(1,groups['mongos_nodes'].__len__()+1)|list }}"
-      register: add_mongos_nodes_to_hosts_file
-  - hosts: mongo_config_nodes
-    vars:
-      newline: "\n"
-    tasks:
-    - name: Write Mongo Config server settings in /etc/mongod.conf
-      when: add_mongos_nodes_to_hosts_file|success       
-      become: true
-      lineinfile:
-        dest: /etc/mongod.conf
-        regexp: "{{ item.regexp }}"
-        line: "{{ item.line }}"
-        backrefs: true
-      with_items:
-        - { regexp: '^(\s*port:\s+)', line: '\g<1>27019' }
-        - { regexp: '^(\s*bindIp:\s+)', line: '\g<1>{{ ansible_default_ipv4["address"] }}' }
-        - { regexp: '^(\s*#replication:\s+)', line: 'replication:{{ newline }} replSetName: configReplSet' }
-        - { regexp: '^(\s*#sharding:\s+)', line: 'sharding:{{ newline }} clusterRole: "configsvr"' }
-      register: config_written
+    
     - name: Disable Transparent huge pages setting
-      when: config_written|success
+      when: pymongo_ansible_installed|success
       copy:
         src: disable-transparent-hugepages
         dest: "/etc/init.d/disable-transparent-hugepages"
         mode: 0755
       register: disable_thp_setting
-    - name: run service disable transparent hugepages
+    
+    - name: Run service to disable transparent hugepages
       when: disable_thp_setting|success
       become: true
       service:
@@ -115,11 +65,13 @@
         state: started
         enabled: yes
       register: disable_thp_service
+    
     - name: Create a new profile for tuned daemon
       when: disable_thp_service|success
       become: true
       file: path=/etc/tuned/no-thp state=directory
       register: new_tuned_profile_create
+    
     - name: Configure new profile for tuned daemon
       when: new_tuned_profile_create|success
       become: true
@@ -135,26 +87,267 @@
         dest: /etc/tuned/no-thp/tuned.conf
         force: no
       register: new_tuned_profile_config
+    
     - name: Start new tuned profile
       when: new_tuned_profile_config|success
       become: true
       shell: tuned-adm profile no-thp
       register: start_new_tuned_profile
-    - name: Restart mongod in Config Servers
+    
+    - name: Add MongoDB repository
       when: start_new_tuned_profile|success
+      yum_repository:
+        name: MongoDB-Repository
+        description: MongoDB Repository
+        baseurl: https://repo.mongodb.org/yum/redhat/$releasever/mongodb-org/4.0/x86_64/
+        gpgcheck: no
+        enabled: yes
+        gpgkey: https://www.mongodb.org/static/pgp/server-4.0.asc
+        state: present
+      register: mongorepoadd
+    
+    - name: Install MongoDB
+      become: true
+      when: mongorepoadd|success
+      yum:
+        pkg: mongodb-org
+        state: installed
+        update_cache: yes
+      register: mongoinstall
+    
+    - name: Add Mongo data nodes and their corresponding IP addresses to /etc/hosts
+      when: mongoinstall|success
+      become: true
+      lineinfile:
+        dest: /etc/hosts        
+        line: "{{ item.0 + ' mongod-' + (item.1|string) }}"
+      with_together:
+      - "{{ groups['mongo_data_nodes'] }}"
+      - "{{ range(1,groups['mongo_data_nodes'].__len__()+1)|list }}"
+      register: add_mongod_nodes_to_hosts_file
+    
+    - name: Add Mongo config nodes and their corresponding IP addresses to /etc/hosts
+      when: add_mongod_nodes_to_hosts_file|success
+      become: true
+      lineinfile:
+        dest: /etc/hosts        
+        line: "{{ item.0 + ' mongoconfig-' + (item.1|string) }}"
+      with_together:
+      - "{{ groups['mongo_config_nodes'] }}"
+      - "{{ range(1,groups['mongo_config_nodes'].__len__()+1)|list }}"
+      register: add_mongo_config_nodes_to_hosts_file
+    
+    - name: Add Mongo query router nodes and their corresponding IP addresses to /etc/hosts
+      when: add_mongo_config_nodes_to_hosts_file|success
+      become: true
+      lineinfile:
+        dest: /etc/hosts        
+        line: "{{ item.0 + ' mongos-' + (item.1|string) }}"
+      with_together:
+      - "{{ groups['mongos_nodes'] }}"
+      - "{{ range(1,groups['mongos_nodes'].__len__()+1)|list }}"
+      register: add_mongos_nodes_to_hosts_file  
+    
+    - name: Write Mongo Config server settings in /etc/mongod.conf
+      when: (inventory_hostname in groups['mongo_config_nodes']) and (add_mongos_nodes_to_hosts_file|success)
+      become: true
+      lineinfile:
+        dest: /etc/mongod.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backrefs: true
+      with_items:
+        - { regexp: '^(\s*port:\s+).*', line: '\g<1>{{ configReplSetPort }}' }
+        - { regexp: '^(\s*bindIp:\s+).*', line: '\g<1>{{ ansible_default_ipv4["address"] }},127.0.0.1' }
+        - { regexp: '^(\s*#security:\s+).*', line: 'security:{{ newline }} keyFile: {{ keyFilePath }}' }
+        - { regexp: '^(\s*#replication:\s+).*', line: 'replication:{{ newline }} replSetName: {{ configReplSetName }}' }
+        - { regexp: '^(\s*#sharding:\s+).*', line: 'sharding:{{ newline }} clusterRole: configsvr' }
+      register: configsvr_config_written
+    
+    - name: Restart mongod in Config Servers
+      when: (inventory_hostname in groups['mongo_config_nodes']) and (configsvr_config_written|success)
       become: true
       systemd:
         name: mongod
         daemon_reload: yes
         state: restarted
-      register: mongod_restarted
-  - hosts: mongo_config_nodes[0]
-    tasks:
-    - name: Initiate MongoDB replica set
-      when: mongod_restarted|success
+      register: mongod_restarted_in_config_servers
+    
+    - name: Initiate MongoDB Configuration Server replica set
+      when: (inventory_hostname in groups['mongo_config_nodes'][0]) and (mongod_restarted_in_config_servers|success)
       become: true
-      mongodb_repl_set:
-        state: initiated
+      mongodb_repl_set_initiate:
+        state: initiated        
+        replSetName: "{{ configReplSetName }}"
         replSetMembers: "{{ ','.join(groups['mongo_config_nodes']) }}"
-        port: 27019
-      register: mongodb_repl_set_initiated
+        port: "{{ configReplSetPort }}"
+      register: mongodb_config_repl_init
+    
+    - name: Create directory for diagnostics in Query Router nodes
+      when: (inventory_hostname in groups['mongos_nodes']) and (mongodb_config_repl_init|success)
+      become: true
+      file: path=/var/log/mongodb/mongos.diagnostic.data state=directory
+      register: mongos_diag_dir_created
+    
+    - name: Query Router Configuration
+      when: (inventory_hostname in groups['mongos_nodes']) and (mongos_diag_dir_created|success)
+      become: true
+      blockinfile:
+        path: /etc/mongos.conf
+        create: yes
+        block: |
+          # where to write logging data.
+          systemLog:
+            destination: file
+            logAppend: true
+            path: /var/log/mongodb/mongos.log
+          security:
+            keyFile: {{ keyFilePath }}
+          # network interfaces
+          net:
+            port: {{ mongoQueryRouterPort }}
+            bindIp: {{ ansible_default_ipv4['address'] }},127.0.0.1
+          sharding:
+            configDB: {{ configReplSetName }}/{{ configReplSetString }}
+      register: query_router_config_written
+    
+    - name: Create Query Router service script
+      when: (inventory_hostname in groups['mongos_nodes']) and (query_router_config_written|success)
+      become: true
+      blockinfile:
+        path: /lib/systemd/system/mongos.service
+        create: yes      
+        block: |
+          [Unit]
+          Description=Mongo Cluster Router
+          After=network.target
+          
+          [Service]
+          User=mongod
+          Group=mongod
+          ExecStart=/usr/bin/mongos --config /etc/mongos.conf
+          # file size
+          LimitFSIZE=infinity
+          # cpu time
+          LimitCPU=infinity
+          # virtual memory size
+          LimitAS=infinity
+          # open files
+          LimitNOFILE=64000
+          # processes/threads
+          LimitNPROC=64000          
+          
+          [Install]
+          WantedBy=multi-user.target
+      register: query_router_service_written
+    
+    - name: Run query router Mongo Service
+      when: (inventory_hostname in groups['mongos_nodes']) and (query_router_service_written|success)
+      become: true
+      systemd:
+        name: mongos
+        daemon_reload: yes
+        state: restarted
+        enabled: yes
+      register: query_router_started    
+    
+    - name: Write Mongo Shard server settings in /etc/mongod.conf - Replica Set 1
+      when: (inventory_hostname in groups['mongo_data_nodes'][:3]) and (query_router_started|success)
+      become: true
+      lineinfile:
+        dest: /etc/mongod.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backrefs: true
+      with_items:
+        - { regexp: '^(\s*port:\s+).*', line: '\g<1>{{ mongoReplSetPort }}' }
+        - { regexp: '^(\s*bindIp:\s+).*', line: '\g<1>{{ ansible_default_ipv4["address"] }},127.0.0.1' }
+        - { regexp: '^(\s*#security:\s+).*', line: 'security:{{ newline }} keyFile: {{ keyFilePath }}' }
+        - { regexp: '^(\s*#replication:\s+).*', line: 'replication:{{ newline }} replSetName: rs0' }
+        - { regexp: '^(\s*#sharding:\s+).*', line: 'sharding:{{ newline }} clusterRole: shardsvr' }
+      register: shard_settings_written_rs1
+
+    - name: Write Mongo Shard server settings in /etc/mongod.conf - Replica Set 2
+      when: (inventory_hostname in groups['mongo_data_nodes'][3:6]) and (shard_settings_written_rs1|success)
+      become: true
+      lineinfile:
+        dest: /etc/mongod.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backrefs: true
+      with_items:
+        - { regexp: '^(\s*port:\s+).*', line: '\g<1>{{ mongoReplSetPort }}' }
+        - { regexp: '^(\s*bindIp:\s+).*', line: '\g<1>{{ ansible_default_ipv4["address"] }},127.0.0.1' }
+        - { regexp: '^(\s*#security:\s+).*', line: 'security:{{ newline }} keyFile: {{ keyFilePath }}' }
+        - { regexp: '^(\s*#replication:\s+).*', line: 'replication:{{ newline }} replSetName: rs1' }
+        - { regexp: '^(\s*#sharding:\s+).*', line: 'sharding:{{ newline }} clusterRole: shardsvr' }
+      register: shard_settings_written_rs2
+
+    - name: Write Mongo Shard server settings in /etc/mongod.conf - Replica Set 3
+      when: (inventory_hostname in groups['mongo_data_nodes'][6:9]) and (shard_settings_written_rs2|success)
+      become: true
+      lineinfile:
+        dest: /etc/mongod.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        backrefs: true
+      with_items:
+        - { regexp: '^(\s*port:\s+).*', line: '\g<1>{{ mongoReplSetPort }}' }
+        - { regexp: '^(\s*bindIp:\s+).*', line: '\g<1>{{ ansible_default_ipv4["address"] }},127.0.0.1' }
+        - { regexp: '^(\s*#security:\s+).*', line: 'security:{{ newline }} keyFile: {{ keyFilePath }}' }
+        - { regexp: '^(\s*#replication:\s+).*', line: 'replication:{{ newline }} replSetName: rs2' }
+        - { regexp: '^(\s*#sharding:\s+).*', line: 'sharding:{{ newline }} clusterRole: shardsvr' }
+      register: shard_settings_written_rs3
+    
+    - name: Restart mongod in MongoDB data nodes
+      when: (inventory_hostname in groups['mongo_data_nodes']) and (shard_settings_written_rs3|success)
+      become: true
+      systemd:
+        name: mongod
+        daemon_reload: yes
+        state: restarted
+      register: mongod_restarted_in_data_nodes
+
+    - name: Initiate MongoDB Data node - Replica Set 1
+      when: (inventory_hostname in groups['mongo_data_nodes'][0]) and (mongod_restarted_in_data_nodes|success)
+      become: true
+      mongodb_repl_set_initiate:
+        state: initiated        
+        replSetName: rs0
+        replSetMembers: "{{ ','.join(groups['mongo_data_nodes'][:3]) }}"
+        port: "{{ mongoReplSetPort }}"
+      register: mongodb_data_repl_init_1
+    
+    - name: Initiate MongoDB Data nodes - Replica Set 2
+      when: (inventory_hostname in groups['mongo_data_nodes'][3]) and (mongodb_data_repl_init_1|success)
+      become: true
+      mongodb_repl_set_initiate:
+        state: initiated        
+        replSetName: rs1
+        replSetMembers: "{{ ','.join(groups['mongo_data_nodes'][3:6]) }}"
+        port: "{{ mongoReplSetPort }}"
+      register: mongodb_data_repl_init_2
+    
+    - name: Initiate MongoDB Data nodes - Replica Set 3
+      when: (inventory_hostname in groups['mongo_data_nodes'][6]) and (mongodb_data_repl_init_2|success)
+      become: true
+      mongodb_repl_set_initiate:
+        state: initiated        
+        replSetName: rs2
+        replSetMembers: "{{ ','.join(groups['mongo_data_nodes'][6:9]) }}"
+        port: "{{ mongoReplSetPort }}"
+      register: mongodb_data_repl_init_3
+
+    - name: Add Shards to Mongo query router
+      when: (inventory_hostname in groups['mongos_nodes'][0]) and (mongodb_data_repl_init_3|success)
+      become: true
+      mongodb_add_shard:
+        state: added
+        primaryQueryRouter: "{{ groups['mongos_nodes'][0] }}"
+        queryRouterPort: "{{ mongoQueryRouterPort }}"
+        shardName: "{{ item.replicaSetID }}/{{ item.replicaSetFirstMember }}:{{ mongoReplSetPort }}"
+      with_items:
+        - { replicaSetID: "rs0", replicaSetFirstMember: "{{ groups['mongo_data_nodes'][0] }}" }
+        - { replicaSetID: "rs1", replicaSetFirstMember: "{{ groups['mongo_data_nodes'][3] }}" }
+        - { replicaSetID: "rs2", replicaSetFirstMember: "{{ groups['mongo_data_nodes'][6] }}" }
+      register: shards_added_to_query_router

@@ -1,0 +1,3 @@
+# Install a role at a specific commit from GitHub
+- name: postgres-ha
+  src: https://github.com/YanChii/ansible-role-postgres-ha
